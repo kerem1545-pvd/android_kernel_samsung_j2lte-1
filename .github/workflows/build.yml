@@ -1,0 +1,158 @@
+name: Build J200F Kernel
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools & toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev make python3-pil git ccache
+          sudo apt-get install -y python2 || true
+          git clone --depth=1 https://github.com/Exynos3475/android_prebuilts_gcc_linux-x86_arm_arm-eabi-4.8 toolchain
+
+      - name: Generate header & patch sysrq (u)
+        run: |
+          python3 - << 'EOF'
+          import re
+          from PIL import Image
+
+          img = Image.open("ani_upload_7_ulusa_nihai.jpg").convert("RGB")
+          w, h = img.size
+          new_h = min(960, max(1, int(540 * h / w)))
+          img = img.resize((540, new_h), Image.LANCZOS)
+
+          with open("drivers/tty/ulusa_img.h", "w") as f:
+              f.write(f"#define ULUSA_W 540\n#define ULUSA_H {new_h}\n")
+              f.write("static const unsigned char ulusa_rgb[] = {\n")
+              raw = img.tobytes()
+              for i in range(0, len(raw), 18):
+                  f.write("  " + ",".join(str(b) for b in raw[i:i+18]) + ",\n")
+              f.write("};\n")
+
+          with open("drivers/tty/sysrq.c", "r") as f:
+              src = f.read()
+
+          inc = (
+              "#include <linux/tty.h>\n"
+              "#include <linux/fb.h>\n"
+              "#include <linux/workqueue.h>\n"
+              "#include <linux/delay.h>\n"
+              "#include <linux/smp.h>\n"
+              "#include <linux/signal.h>\n"
+              "#include \"ulusa_img.h\"\n"
+          )
+          assert "#include <linux/tty.h>" in src, "tty.h not found"
+          src = src.replace("#include <linux/tty.h>", inc, 1)
+
+          handler_code = """
+          static void ulusa_draw_and_halt(struct work_struct *work)
+          {
+              struct task_struct *p;
+              struct fb_info *info;
+              u32 x, y, y_off, bpp, stride, clear_len;
+              u8 __force *base;
+              u8 *dst;
+
+              rcu_read_lock();
+              for_each_process(p) {
+                  if (p->pid > 1 && !(p->flags & PF_KTHREAD))
+                      send_sig(SIGKILL, p, 1);
+              }
+              rcu_read_unlock();
+
+              msleep(60);
+
+              info = registered_fb[0];
+              if (info && info->screen_base) {
+                  if (lock_fb_info(info)) {
+                      info->var.xoffset = 0;
+                      info->var.yoffset = 0;
+                      if (info->fbops && info->fbops->fb_set_par)
+                          info->fbops->fb_set_par(info);
+
+                      bpp = info->var.bits_per_pixel / 8;
+                      stride = info->fix.line_length;
+                      clear_len = stride * info->var.yres;
+                      base = (u8 __force *)info->screen_base;
+                      memset(base, 0, clear_len);
+
+                      y_off = (info->var.yres > ULUSA_H) ? (info->var.yres - ULUSA_H) / 2 : 0;
+                      for (y = 0; y < ULUSA_H && (y + y_off) < info->var.yres; y++) {
+                          for (x = 0; x < ULUSA_W && x < info->var.xres; x++) {
+                              u32 idx = (y * ULUSA_W + x) * 3;
+                              u8 r = ulusa_rgb[idx];
+                              u8 g = ulusa_rgb[idx + 1];
+                              u8 b = ulusa_rgb[idx + 2];
+                              dst = base + (y + y_off) * stride + x * bpp;
+                              if (bpp == 4) {
+                                  u32 px = ((u32)r << info->var.red.offset) |
+                                           ((u32)g << info->var.green.offset) |
+                                           ((u32)b << info->var.blue.offset) |
+                                           ((u32)0xFF << info->var.transp.offset);
+                                  *((u32 *)dst) = px;
+                              } else if (bpp == 2) {
+                                  u16 px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                                  *((u16 *)dst) = px;
+                              }
+                          }
+                      }
+
+                      if (info->fbops && info->fbops->fb_pan_display)
+                          info->fbops->fb_pan_display(&info->var, info);
+
+                      unlock_fb_info(info);
+                  }
+              }
+
+              local_irq_disable();
+              smp_send_stop();
+              while (1)
+                  cpu_relax();
+          }
+
+          static DECLARE_WORK(ulusa_work, ulusa_draw_and_halt);
+
+          static void sysrq_handle_ulusa(int key)
+          {
+              schedule_work(&ulusa_work);
+          }
+
+          static struct sysrq_key_op sysrq_ulusa_op = {
+              .handler = sysrq_handle_ulusa,
+              .help_msg = "ulusa(u)",
+              .action_msg = "Ulusa Nihai Screen",
+              .enable_mask = SYSRQ_ENABLE_REMOUNT,
+          };
+          """
+
+          m = re.search(r'(static\s+(?:const\s+)?struct\s+sysrq_key_op\s*\*sysrq_key_table)', src)
+          assert m, "sysrq_key_table not found"
+          src = src[:m.start()] + handler_code + "\n" + src[m.start():]
+
+          src, n = re.subn(r'&sysrq_mountro_op,\s*/\*\s*u\s*\*/', '&sysrq_ulusa_op, /* u */', src)
+          assert n == 1, "u slot not found in sysrq_key_table"
+
+          with open("drivers/tty/sysrq.c", "w") as f:
+              f.write(src)
+          EOF
+
+      - name: Compile zImage
+        run: |
+          export ARCH=arm
+          export CROSS_COMPILE=$(pwd)/toolchain/bin/arm-eabi-
+          ls arch/arm/configs/
+          DEF=$(ls arch/arm/configs/ | grep -E "j2lte|j200f|exynos3475" | head -n 1)
+          echo "Secilen config: $DEF"
+          make $DEF
+          echo "CONFIG_MAGIC_SYSRQ=y" >> .config
+          yes "" | make oldconfig
+          make -j$(nproc) zImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: j200f-zImage
+          path: arch/arm/boot/zImage
